@@ -1,0 +1,20 @@
+# build
+build/
+dist/
+target/
+*.exe
+*.exe~
+*.dll
+
+# tmp
+tmp/
+temp/
+*.tmp
+*.bak
+
+# secrets
+token.json
+
+# logs
+logs/
+*.log

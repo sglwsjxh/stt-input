@@ -1,0 +1,46 @@
+name: CI Build
+
+on:
+  pull_request:
+    branches: [main]
+
+  push:
+    branches: [main]
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Verify binaries
+        shell: pwsh
+        run: |
+          if (-not (Test-Path target/release/stt-input.exe)) {
+            Throw "stt-input.exe not found after build"
+          }
+          Write-Host "Build succeeded, output:"
+          Get-Item target/release/stt-input.exe | Select-Object Name, Length, LastWriteTime
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stt-input-ci-${{ github.sha }}
+          path: target/release/stt-input.exe
