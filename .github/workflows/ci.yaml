@@ -40,7 +40,7 @@ jobs:
           Get-Item target/release/stt-input.exe | Select-Object Name, Length, LastWriteTime
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: stt-input-ci-${{ github.sha }}
           path: target/release/stt-input.exe
