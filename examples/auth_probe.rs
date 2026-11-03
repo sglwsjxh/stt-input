@@ -1,3 +1,18 @@
+// stt-input - push-to-talk console dictation
+// Copyright (C) 2026 清木殇 (sglwsjxh)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
 // 认证来源探针：打印当前会走哪一级，并真实发起一次设备码请求验证代理连通
 // 独立编译整个 auth 模块，bin-only crate 的 example 拿不到 crate 内模块
 #![allow(dead_code)]

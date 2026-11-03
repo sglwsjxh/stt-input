@@ -2,6 +2,8 @@
 name = "stt-input"
 version = "0.1.0"
 edition = "2024"
+description = "A voice input method based on the MAI STT service"
+license = "GPL-3.0-or-later"
 
 [[bin]]
 name = "stt-input"

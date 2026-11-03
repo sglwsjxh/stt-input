@@ -1,3 +1,22 @@
+// stt-input - push-to-talk console dictation
+// Copyright (C) 2026 清木殇 (sglwsjxh)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+// Ported from Hex (https://github.com/anomalyco/hex), MIT License.
+// Copyright (c) anomalyco - original WindowsPaster implementation.
+
 // 文本注入：剪贴板快照、写入转写文本、合成 Ctrl+V、延迟恢复
 // 移植自 hex 的 WindowsPaster（github.com/anomalyco/hex，MIT 许可）
 

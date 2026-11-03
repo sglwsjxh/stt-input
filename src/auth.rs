@@ -1,3 +1,18 @@
+// stt-input - push-to-talk console dictation
+// Copyright (C) 2026 清木殇 (sglwsjxh)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
 // GitHub 令牌获取：环境变量 -> 本地便携缓存 -> gh CLI -> OAuth 设备码流程 四级回退
 // 缓存是 exe 同目录的明文 token.json：便携优先的取舍，文件夹整体拷走凭据跟着走，
 // 目录读写权限由用户自行负责，不落任何用户主目录/应用数据目录
