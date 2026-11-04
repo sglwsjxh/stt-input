@@ -1,6 +1,10 @@
 <h1 align="center">stt-input</h1>
 
 <p align="center">
+  <img src="assets/icon.png" width="128" alt="stt-input icon" />
+</p>
+
+<p align="center">
   <a href="README.md">English</a>
   |
   <a href="README-zh.md">简体中文</a>
@@ -16,7 +20,7 @@
 
 ## 工作原理
 
-- 按住空格键：从默认录音设备采集 16 kHz 单声道音频
+- 按住右Ctrl：从默认录音设备采集 16 kHz 单声道音频
 - 音频经 WebSocket 流式推送到 MAI 转写端点
 - 使用 GitHub OAuth 令牌鉴权，与 VS Code 语音模式一致
 - 松开空格键：识别终稿写入剪贴板并以 Ctrl+V 粘贴
@@ -39,11 +43,12 @@ target\release\stt-input.exe
 
 ## 使用
 
-按住空格键说话，松开自动粘贴
+按住右Ctrl说话，松开自动粘贴。程序以后台方式运行，不显示控制台窗口
 
 | 参数 | 作用 |
 | --- | --- |
-| 无参数 | 进入听写主循环 |
+| 无参数 | 进入听写主循环（后台运行，无控制台窗口） |
+| `-v`、`--verbose` | 将日志写入 exe 同目录 `stt-input.log`（每次启动覆盖） |
 | `--install-autostart` | 注册开机自启（HKCU Run 键） |
 | `--uninstall-autostart` | 移除开机自启 |
 | `--print-auth-mode` | 显示当前生效的凭据来源 |
@@ -69,7 +74,7 @@ src/auth.rs        GitHub 令牌：env → token.json → gh → 设备码
 src/stt.rs         MAI 转写 WebSocket 客户端（代理 + TLS）
 src/capture.rs     麦克风采集，16 kHz 单声道 s16le，100 ms 分块
 src/paste.rs       剪贴板注入，移植自 Hex
-src/hotkey.rs      空格键状态轮询
+src/hotkey.rs      右Ctrl 热键轮询
 src/overlay.rs     语音电平条窗口
 src/autostart.rs   注册表开机自启
 ```

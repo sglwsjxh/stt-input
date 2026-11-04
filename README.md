@@ -1,6 +1,10 @@
 <h1 align="center">stt-input</h1>
 
 <p align="center">
+  <img src="assets/icon.png" width="128" alt="stt-input icon" />
+</p>
+
+<p align="center">
   <a href="README.md">English</a>
   |
   <a href="README-zh.md">简体中文</a>
@@ -16,7 +20,7 @@ Hold space, speak, release — the transcript is pasted into whatever app has fo
 
 ## How it works
 
-- Hold space: captures 16 kHz mono audio from the default microphone
+- Hold right Ctrl: captures 16 kHz mono audio from the default microphone
 - Streams audio over WebSocket to the MAI transcription endpoint
 - Authenticates with a GitHub OAuth token, same as VS Code voice mode
 - Release space: the final transcript is placed on the clipboard and pasted with Ctrl+V
@@ -39,11 +43,12 @@ target\release\stt-input.exe
 
 ## Usage
 
-Hold space and speak, release to paste
+Hold right Ctrl and speak, release to paste
 
 | Flag | Effect |
 | --- | --- |
-| none | Run the dictation loop |
+| none | Run the dictation loop in the background, no console window |
+| `-v`, `--verbose` | Write logs to `stt-input.log` next to the exe (overwritten on each start) |
 | `--install-autostart` | Launch at login (HKCU Run key) |
 | `--uninstall-autostart` | Remove the autostart entry |
 | `--print-auth-mode` | Show the active credential source |
@@ -69,7 +74,7 @@ src/auth.rs        GitHub token: env → token.json → gh → device flow
 src/stt.rs         MAI transcription WebSocket client (proxy + TLS)
 src/capture.rs     microphone capture, 16 kHz mono s16le, 100 ms chunks
 src/paste.rs       clipboard injection, ported from Hex
-src/hotkey.rs      space key state polling
+src/hotkey.rs      right Ctrl hotkey polling
 src/overlay.rs     voice level bar window
 src/autostart.rs   registry autostart
 ```
