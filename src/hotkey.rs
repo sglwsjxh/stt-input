@@ -13,14 +13,14 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-// 空格键热键检测：主循环轮询用，不起线程
+// Ctrl+Space 热键检测：主循环轮询用，不起线程
 
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_SPACE};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_RCONTROL};
 
-/// 空格键当前是否按下。GetAsyncKeyState 最高位为 1 表示按下，
+/// 右 Ctrl 当前是否按下。GetAsyncKeyState 最高位为 1 表示按下，
 /// 转 i16 后看符号即可；低位（曾被按下）不用，轮询场景要的是瞬时状态
-pub fn space_down() -> bool {
-    let state = unsafe { GetAsyncKeyState(i32::from(VK_SPACE)) };
+pub fn hotkey_down() -> bool {
+    let state = unsafe { GetAsyncKeyState(i32::from(VK_RCONTROL)) };
     (state as i16) < 0
 }
 
@@ -29,7 +29,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn query_does_not_panic() {
-        let _ = space_down();
+    fn hotkey_press_query_does_not_panic() {
+        let _ = hotkey_down();
     }
 }
