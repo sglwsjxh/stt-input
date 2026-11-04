@@ -435,12 +435,17 @@ pub(crate) async fn poll_device_token(session: &mut DeviceSession) -> Result<Pol
 }
 
 pub(crate) async fn device_flow() -> Result<String> {
+    // 控制台默认提示：横线框打印验证码
+    device_flow_with(&|message| println!("{message}")).await
+}
+
+// 带自定义提示回调的设备码授权：GUI 无控制台模式下用弹窗展示验证码
+pub(crate) async fn device_flow_with(notify: &dyn Fn(&str)) -> Result<String> {
     let mut session = request_device_code().await?;
-    println!("------------------------------------------------------------");
-    println!("  请在浏览器打开: {}", session.verification_uri);
-    println!("  输入验证码:     {}", session.user_code);
-    println!("  有效期 {} 秒，请在浏览器里点确认授权", session.expires_in);
-    println!("------------------------------------------------------------");
+    notify(&format!(
+        "请在浏览器打开: {}\n输入验证码: {}\n有效期 {} 秒，请在浏览器里点确认授权",
+        session.verification_uri, session.user_code, session.expires_in
+    ));
     tracing::info!("设备码已下发 {}，有效期 {} 秒", session.user_code, session.expires_in);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(session.expires_in) + POLL_GRACE;
