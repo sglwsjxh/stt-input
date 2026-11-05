@@ -1,6 +1,6 @@
 [package]
 name = "stt-input"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2024"
 description = "A voice input method based on the MAI STT service"
 license = "GPL-3.0-or-later"
