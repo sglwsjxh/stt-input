@@ -78,12 +78,12 @@ fn bar_count(width: i32) -> i32 {
     ((width - 2 * PAD - CURSOR_W - GAP) / (BAR_W + GAP)).max(0)
 }
 
-/// 电平采样成单根高度：静音记点，有声线性映射到可用高
+/// 电平采样成单根高度：静音记点，平方根映射让低音量也有可见振幅
 fn sample_height(level: u8) -> i32 {
     if level == 0 {
         return DOT_H;
     }
-    ((MAX_H as u16 * level as u16 / 255) as i32).clamp(BAR_W, MAX_H)
+    ((MAX_H as f64 * (level as f64 / 255.0).sqrt()) as i32).clamp(BAR_W, MAX_H)
 }
 
 /// 新样本入队尾，超出容量挤掉最旧一根，波形整体向左推进
@@ -353,12 +353,15 @@ mod tests {
     }
 
     #[test]
-    fn sample_height_maps_level_linearly() {
+    fn sample_height_boosts_quiet_levels() {
         assert_eq!(sample_height(0), DOT_H);
         assert_eq!(sample_height(255), MAX_H);
-        assert_eq!(sample_height(128), MAX_H * 128 / 255);
-        assert!(sample_height(64) < sample_height(128));
-        assert!(sample_height(128) < sample_height(192));
+        // 平方根映射：电平 16（很轻的声音）也有约十分之一满高的可见振幅
+        assert!(sample_height(16) > MAX_H / 10);
+        assert!(sample_height(16) > sample_height(0));
+        assert!(sample_height(64) > sample_height(16));
+        assert!(sample_height(128) > sample_height(64));
+        assert!(sample_height(192) > sample_height(128));
     }
 
     #[test]

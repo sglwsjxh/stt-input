@@ -257,9 +257,9 @@ async fn do_turn(
         o.set_visible(true);
     }
     let started = Instant::now();
-    // 已上屏内容（committed 水位线）；已粘出去的收不回，只在前缀一致时续粘
-    let mut pasted = String::new();
-    let mut stream_on = true;
+    // 流式状态：provisional = 当前段已上屏文本；清空帧把当前段作废后撤回重打
+    let mut provisional = String::new();
+    let mut revoked = false;
     loop {
         match tokio::time::timeout(POLL, rx.recv()).await {
             Ok(Some(block)) => {
@@ -267,19 +267,22 @@ async fn do_turn(
                     o.set_level(peak_level(&block));
                 }
                 c.push_audio(&turn, &block).await;
-                // 流式上屏：边说边把新定稿片段粘到光标处
-                let committed = c.try_committed(&turn);
-                if stream_on && !committed.is_empty() {
-                    if committed.starts_with(&pasted) {
-                        if committed.len() > pasted.len() {
-                            match paster.paste(&committed[pasted.len()..]) {
-                                Ok(()) => pasted = committed,
-                                Err(e) => tracing::warn!("流式粘贴失败: {e}"),
-                            }
+                let (_, text) = c.try_transcript(&turn);
+                match stream_step(&mut provisional, &mut revoked, &text) {
+                    StreamStep::Idle => {}
+                    StreamStep::Append(chunk) => {
+                        if let Err(e) = paster.paste(&chunk) {
+                            tracing::warn!("流式粘贴失败: {e}");
                         }
-                    } else {
-                        tracing::warn!("committed 改写了已上屏前缀，停止流式输出");
-                        stream_on = false;
+                    }
+                    StreamStep::Rewrite { backspaces, text } => {
+                        // 段落被服务端推翻：删旧段粘新段，仿 Win+H 的撤回重打
+                        if let Err(e) = paster.erase(backspaces) {
+                            tracing::warn!("流式撤回失败: {e}");
+                        }
+                        if let Err(e) = paster.paste(&text) {
+                            tracing::warn!("流式粘贴失败: {e}");
+                        }
                     }
                 }
             }
@@ -304,26 +307,108 @@ async fn do_turn(
     }
     c.end_turn(&turn).await;
     let text = c.await_final(&turn, FINAL_WAIT).await.wrap_err("识别失败")?;
-    // final 为权威全文，与已上屏前缀一致才补粘残余尾巴，改写或缩短都收不回已粘部分
-    if text.starts_with(&pasted) {
-        let tail = &text[pasted.len()..];
+    if provisional.is_empty() && !revoked && text.trim().is_empty() {
+        tracing::info!("未识别到内容");
+        return Ok(());
+    }
+    // final 为权威全文：当前段被作废或与 final 不一致就撤回残影重打，一致则续粘尾巴
+    let stale = revoked || !text.starts_with(provisional.as_str());
+    if stale {
+        let chars = provisional.chars().count();
+        if chars > 0 && let Err(e) = paster.erase(chars) {
+            tracing::warn!("final 撤回残影失败: {e}");
+        }
+    }
+    let from = if stale { 0 } else { provisional.len() };
+    if text.len() > from && text.is_char_boundary(from) {
+        let tail = &text[from..];
         if !tail.trim().is_empty() {
             paster.paste(tail)?;
         }
-    } else {
-        tracing::warn!("final 与已上屏前缀不一致，跳过尾巴补粘");
-    }
-    if pasted.is_empty() && text.trim().is_empty() {
-        tracing::info!("未识别到内容");
-        return Ok(());
     }
     tracing::info!(%text, "已粘贴");
     Ok(())
 }
 
+/// 流式一步决策：清空帧作废当前段，段落被推翻则撤回重打，段内续写只粘增量
+fn stream_step(provisional: &mut String, revoked: &mut bool, text: &str) -> StreamStep {
+    // 清空帧：当前段作废标记，延迟到下一段内容到来时一并撤回，减少键入
+    if text.is_empty() {
+        if !provisional.is_empty() {
+            *revoked = true;
+        }
+        return StreamStep::Idle;
+    }
+    if *revoked || !text.starts_with(provisional.as_str()) {
+        let step = StreamStep::Rewrite {
+            backspaces: provisional.chars().count(),
+            text: text.to_string(),
+        };
+        *provisional = text.to_string();
+        *revoked = false;
+        return step;
+    }
+    if text.len() > provisional.len() {
+        let chunk = text[provisional.len()..].to_string();
+        *provisional = text.to_string();
+        return StreamStep::Append(chunk);
+    }
+    StreamStep::Idle
+}
+
+enum StreamStep {
+    Idle,
+    Append(String),
+    Rewrite { backspaces: usize, text: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 走一遍探针实测的帧序列：首段 → 清空作废 → 服务端重写的新段 → final 收尾
+    #[test]
+    fn stream_step_follows_probe_sequence() {
+        let mut provisional = String::new();
+        let mut revoked = false;
+        // 首段 partial：粘全文
+        let step = stream_step(&mut provisional, &mut revoked, "测试听写一二。");
+        assert!(matches!(step, StreamStep::Append(ref c) if c == "测试听写一二。"));
+        assert_eq!(provisional, "测试听写一二。");
+        // 清空帧：只作废不撤回
+        assert!(matches!(stream_step(&mut provisional, &mut revoked, ""), StreamStep::Idle));
+        assert!(revoked);
+        // 重写的新段：撤回 7 个字符（中文按字符不按字节），粘新段全文
+        let step = stream_step(&mut provisional, &mut revoked, "测试听写，123，Hello World，语音识别。");
+        assert!(
+            matches!(step, StreamStep::Rewrite { backspaces: 7, ref text }
+                if text == "测试听写，123，Hello World，语音识别。"),
+            "step 不匹配"
+        );
+        assert_eq!(provisional, "测试听写，123，Hello World，语音识别。");
+        assert!(!revoked);
+        // 再次清空后 final 与残影不一致：收尾判定走撤回重打
+        assert!(matches!(stream_step(&mut provisional, &mut revoked, ""), StreamStep::Idle));
+        assert!(revoked);
+        let final_text = "测试听写，123，Hello World，语音识别测试。";
+        let stale = revoked || !final_text.starts_with(provisional.as_str());
+        assert!(stale, "被作废的段必须走撤回重打");
+    }
+
+    #[test]
+    fn stream_step_appends_within_paragraph() {
+        let mut provisional = String::new();
+        let mut revoked = false;
+        assert!(matches!(stream_step(&mut provisional, &mut revoked, "你好"), StreamStep::Append(_)));
+        let step = stream_step(&mut provisional, &mut revoked, "你好世界");
+        assert!(matches!(step, StreamStep::Append(ref c) if c == "世界"));
+        assert_eq!(provisional, "你好世界");
+        // 无增长的重复帧是 Idle
+        assert!(matches!(stream_step(&mut provisional, &mut revoked, "你好世界"), StreamStep::Idle));
+        // final 与已上屏一致：收尾判定走续粘尾巴
+        let stale = revoked || !"你好世界。".starts_with(provisional.as_str());
+        assert!(!stale);
+    }
 
     #[test]
     fn peak_level_maps_scale() {

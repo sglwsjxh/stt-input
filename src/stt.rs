@@ -72,7 +72,7 @@ enum Evt {
         turn_id: String,
         status: String,
         text: String,
-        // 已定稿前缀，partial 帧中途即有值；final 帧恒等于 text
+        // 段落定稿累积全文；段落边界更新，段落内不变
         committed: String,
     },
     Error {
@@ -96,8 +96,7 @@ struct ServerMsg {
     revision: u64,
     #[serde(default)]
     turn_id: String,
-    // committed 恒存在，partial 为空串，按实测形状声明为 String 防类型漂移
-    #[allow(dead_code)]
+    // committed 为段落定稿累积全文；text 为当前段落 provisional，段落边界清空
     #[serde(default)]
     committed: String,
     #[serde(default)]
@@ -225,15 +224,15 @@ impl TranscriptionClient {
         }
     }
 
-    // 非阻塞捞本 turn 已定稿前缀，多条积压取最新；软错误与非本 turn 帧同 await_final 规则消化
-    pub fn try_committed(&mut self, turn_id: &str) -> String {
-        let mut committed = String::new();
+    // 非阻塞捞本 turn 最新转写状态，返回 (累计定稿 committed, 当前段 provisional text)
+    pub fn try_transcript(&mut self, turn_id: &str) -> (String, String) {
+        let mut state = (String::new(), String::new());
         loop {
             let evt = match self.pending.pop_front() {
                 Some(e) => e,
                 None => match self.evt_rx.try_recv() {
                     Ok(e) => e,
-                    Err(_) => return committed,
+                    Err(_) => return state,
                 },
             };
             // final、终端错误、死亡帧停手放回队头保持原序，其余帧消化跳过
@@ -247,16 +246,17 @@ impl TranscriptionClient {
             };
             if sticky {
                 self.pending.push_front(evt);
-                return committed;
+                return state;
             }
             if let Evt::Transcription {
                 turn_id: t,
-                committed: c,
+                text,
+                committed,
                 ..
             } = evt
                 && t == turn_id
             {
-                committed = c;
+                state = (committed, text);
             }
         }
     }
@@ -492,7 +492,16 @@ fn worker_loop(
                             return;
                         }
                     }
-                    _ => {}
+                    _ => {
+                        // 未知帧可能是协议演进的定稿/提交信号，留下原始形状供诊断
+                        tracing::debug!(
+                            "未知下行帧 type={} text={} committed={} turn={}",
+                            msg.kind,
+                            msg.text,
+                            msg.committed,
+                            msg.turn_id
+                        );
+                    }
                 }
             }
             Ok(Message::Close(frame)) => {
@@ -719,14 +728,9 @@ mod tests {
         let _ = ws.send(Message::text(v.to_string()));
     }
 
-    // 帧形与实测样本一致：committed 恒存在，partial 中途即携带已定稿前缀
-    fn transcription(
-        turn: &str,
-        text: &str,
-        status: &str,
-        revision: u64,
-        committed: &str,
-    ) -> Value {
+    // 帧形与实测一致：committed 恒存在，partial 中途为空串，final 等于 text
+    fn transcription(turn: &str, text: &str, status: &str, revision: u64) -> Value {
+        let committed = if status == "final" { text } else { "" };
         json!({
             "type":"transcription","text":text,"status":status,
             "committed":committed,
@@ -778,12 +782,12 @@ mod tests {
                     _ => {}
                 }
             }
-            send_json(ws, transcription(&turn, "测试听写一二。", "partial", 1, "测试听写。"));
-            send_json(ws, transcription(&turn, "语音识别测。", "partial", 2, "语音识别。"));
+            send_json(ws, transcription(&turn, "测试听写一二。", "partial", 1));
+            send_json(ws, transcription(&turn, "语音识别测。", "partial", 2));
             // 乱序补发旧 revision，客户端应丢弃
-            send_json(ws, transcription(&turn, "STALE", "partial", 1, ""));
+            send_json(ws, transcription(&turn, "STALE", "partial", 1));
             let final_text = format!("FINAL chunks={chunks} b64={b64_len}");
-            send_json(ws, transcription(&turn, &final_text, "final", 3, &final_text));
+            send_json(ws, transcription(&turn, &final_text, "final", 3));
             thread::sleep(Duration::from_secs(2));
         });
         let mut c = TranscriptionClient::open(client_url(addr), true).await?;
@@ -803,9 +807,9 @@ mod tests {
             send_json(ws, json!({"type":"session_init","session_id":"t"}));
             let start = next_cmd_text(ws, "ptt_start");
             let turn = start["turn_id"].as_str().unwrap_or("").to_string();
-            send_json(ws, transcription(&turn, "P2", "partial", 2, "P2"));
+            send_json(ws, transcription(&turn, "P2", "partial", 2));
             // 若 <= 已见 revision 未被丢弃，await_final 会拿到 P1-STALE
-            send_json(ws, transcription(&turn, "P1-STALE", "partial", 1, ""));
+            send_json(ws, transcription(&turn, "P1-STALE", "partial", 1));
             thread::sleep(Duration::from_secs(3));
         });
         let mut c = TranscriptionClient::open(client_url(addr), true).await?;
@@ -832,16 +836,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_committed_streams_prefix_and_spares_final() -> Result<()> {
+    async fn try_transcript_streams_text_and_spares_final() -> Result<()> {
         let addr = fake_server(|ws| {
             send_json(ws, json!({"type":"session_init","session_id":"t"}));
             let start = next_cmd_text(ws, "ptt_start");
             let turn = start["turn_id"].as_str().unwrap_or("").to_string();
-            send_json(ws, transcription(&turn, "你好", "partial", 1, "你好"));
-            send_json(ws, transcription(&turn, "你好世界", "partial", 2, "你好世界"));
+            send_json(ws, transcription(&turn, "你好", "partial", 1));
+            send_json(ws, transcription(&turn, "你好世界", "partial", 2));
             // 软错误帧应被暂存绕过，不影响流式轮询与 final
             send_json(ws, json!({"type":"error","code":0,"detail":"soft","turn_id":&turn}));
-            send_json(ws, transcription(&turn, "你好世界。", "final", 3, "你好世界。"));
+            send_json(ws, transcription(&turn, "你好世界。", "final", 3));
             thread::sleep(Duration::from_secs(2));
         });
         let mut c = TranscriptionClient::open(client_url(addr), true).await?;
@@ -849,15 +853,17 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut got = String::new();
         while got != "你好世界" && Instant::now() < deadline {
-            let latest = c.try_committed(&turn);
-            if !latest.is_empty() {
-                got = latest;
+            let (committed, text) = c.try_transcript(&turn);
+            // 模拟组合全文：已定稿前缀 + 当前段 provisional
+            let full = format!("{committed}{text}");
+            if !full.is_empty() {
+                got = full;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(got, "你好世界");
         c.end_turn(&turn).await;
-        // final 被 try_committed 暂存而非吞掉，await_final 仍能拿到
+        // final 被 try_transcript 暂存而非吞掉，await_final 仍能拿到
         let out = c.await_final(&turn, Duration::from_secs(5)).await?;
         assert_eq!(out, "你好世界。");
         Ok(())
@@ -869,7 +875,7 @@ mod tests {
             send_json(ws, json!({"type":"session_init","session_id":"t"}));
             let start = next_cmd_text(ws, "ptt_start");
             let turn = start["turn_id"].as_str().unwrap_or("").to_string();
-            send_json(ws, transcription(&turn, "P", "partial", 1, "P"));
+            send_json(ws, transcription(&turn, "P", "partial", 1));
             let _ = ws.close(None);
             thread::sleep(Duration::from_millis(300));
         });
@@ -877,7 +883,9 @@ mod tests {
         let turn = c.start_turn().await;
         // 捞走 partial；worker 收 Close 发出的 Dead 帧被暂存
         let deadline = Instant::now() + Duration::from_secs(2);
-        while c.try_committed(&turn).is_empty() && Instant::now() < deadline {
+        while c.try_transcript(&turn) == (String::new(), String::new())
+            && Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         c.end_turn(&turn).await;

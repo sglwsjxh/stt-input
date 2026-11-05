@@ -34,8 +34,8 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyboardLayout, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyExW, SendInput, VK_CONTROL, VK_LWIN, VK_MENU,
-    VK_RWIN, VK_SHIFT, VK_V,
+    KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MapVirtualKeyExW, SendInput, VK_BACK, VK_CONTROL, VK_LWIN,
+    VK_MENU, VK_RWIN, VK_SHIFT, VK_V,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
@@ -199,6 +199,33 @@ impl WindowsPaster {
             thread::sleep(restore_delay);
             restore_clipboard_generation(&clipboard_restore, generation);
         });
+        Ok(())
+    }
+
+    /// 发 n 个退格：流式转写撤回被推翻的段落文本。用户按着 Ctrl（热键）时先
+    /// 合成松开、打完再补回，避免退格被系统当成 Ctrl+Backspace 删整词
+    pub fn erase(&mut self, count: usize) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        wait_for_conflicting_modifiers();
+        let scan = foreground_scan_code(VK_BACK);
+        let ctrl_was_down = key_down(VK_CONTROL);
+        let mut inputs = Vec::with_capacity(count * 2 + 2);
+        if ctrl_was_down {
+            inputs.push(keyboard_input(VK_CONTROL, foreground_scan_code(VK_CONTROL), KEYEVENTF_KEYUP));
+        }
+        for _ in 0..count {
+            inputs.push(keyboard_input(VK_BACK, scan, 0));
+            inputs.push(keyboard_input(VK_BACK, scan, KEYEVENTF_KEYUP));
+        }
+        if ctrl_was_down {
+            inputs.push(keyboard_input(VK_CONTROL, foreground_scan_code(VK_CONTROL), 0));
+        }
+        let sent = send_inputs(&inputs);
+        if sent != inputs.len() as u32 {
+            return Err(eyre!("Windows 只接受了 {sent}/{} 个合成退格", inputs.len()));
+        }
         Ok(())
     }
 }
