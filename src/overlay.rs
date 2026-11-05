@@ -13,9 +13,9 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
-// 语音波形条：录音时置顶深灰底白色对称波形动画，纯 Win32 + GDI，零新增依赖
+// 语音波形条：录音时置顶深灰底录音机风格滚动波形，纯 Win32 + GDI，零新增依赖
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -44,8 +44,8 @@ unsafe extern "system" {
     fn GetModuleHandleW(lpmodulename: *const u16) -> *mut c_void;
 }
 
-const WIDTH: i32 = 320;
-const HEIGHT: i32 = 14;
+const WIDTH: i32 = 213;
+const HEIGHT: i32 = 25;
 const PAD: i32 = 10;
 const ALPHA: u8 = 200;
 const TICK_MS: u32 = 30;
@@ -53,12 +53,11 @@ const TIMER_ID: usize = 1;
 const CLASS_NAME: &str = "SttInputOverlay";
 
 // 波形视觉参数
-const BAR_W: i32 = 5; // 竖条宽
+const BAR_W: i32 = 2; // 竖条宽，录音机细线风格
 const GAP: i32 = 2; // 竖条间隙
-const DOT_H: i32 = 2; // 静音小点高
-const MAX_H: i32 = 12; // 有声条最大可用高，留 1px 上下居中余量
-const CENTER_MIN: i32 = 5; // 有声时至少活跃的中间根数
-const SPREAD_MIN: i32 = 6; // 包络宽度下限，防止窄窗下波形塌成一根
+const DOT_H: i32 = 2; // 圆点直径，方点近似
+const MAX_H: i32 = 23; // 有声条最大可用高，留 1px 上下居中余量
+const CURSOR_W: i32 = 3; // 右侧写入光标宽
 const BG_COLOR: COLORREF = 0x0030_2D2D; // RGB(45,45,48) 深灰底
 const FG_COLOR: COLORREF = 0x00F0_F0F0; // RGB(240,240,240) 波形白
 
@@ -68,58 +67,31 @@ static SHARED: OnceLock<(Arc<AtomicU8>, Arc<AtomicBool>)> = OnceLock::new();
 thread_local! {
     static SHOWN: Cell<bool> = const { Cell::new(false) };
     static HIDE_AT: Cell<Option<Instant>> = const { Cell::new(None) };
-    static FRAME: Cell<u32> = const { Cell::new(0) };
     static BG_BRUSH: OnceCell<HBRUSH> = const { OnceCell::new() };
     static FG_BRUSH: OnceCell<HBRUSH> = const { OnceCell::new() };
+    // 波形历史，队尾 = 最新 = 光标旁；录音结束后清空
+    static HISTORY: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
 }
 
-/// 条数由窗口宽自动算出：两侧留边后按条宽加间隙的节拍排布
+/// 条数由窗口宽自动算出：两侧留边、扣掉光标位后按条宽加间隙的节拍排布
 fn bar_count(width: i32) -> i32 {
-    ((width - 2 * PAD) / (BAR_W + GAP)).max(0)
+    ((width - 2 * PAD - CURSOR_W - GAP) / (BAR_W + GAP)).max(0)
 }
 
-/// 活跃根数：电平线性映射后向上取整，至少中间 CENTER_MIN 根，不超过总根数
-fn active_count(level: u8, total: i32) -> i32 {
-    let n = (level as i32 * total + 254) / 255;
-    n.max(CENTER_MIN).min(total.max(0))
-}
-
-/// 钟形包络，中心为 1，离中心越远衰减越快
-fn envelope(i: i32, center: i32, spread: f64) -> f64 {
-    let d = (i - center) as f64 / spread;
-    (-(d * d)).exp()
-}
-
-// 边缘淡出：最外侧条压到满高的 1/6，向内 6 根线性恢复，波形不顶着窗口边缘生硬收尾
-const EDGE_FADE: i32 = 6;
-const EDGE_MIN: f64 = 1.0 / 6.0;
-
-fn edge_damp(i: i32, total: i32) -> f64 {
-    let edge = i.min(total - 1 - i);
-    let f = (edge as f64 / EDGE_FADE as f64).min(1.0);
-    EDGE_MIN + (1.0 - EDGE_MIN) * f
-}
-
-/// 无状态 hash 抖动，逐帧变化，免引随机数 crate；值域 0.85~1.15
-fn jitter(i: i32, frame: u32) -> f64 {
-    let h = (i as u32).wrapping_mul(73856093) ^ frame.wrapping_mul(19349663);
-    0.85 + (h as f64 * 0.6180339887).fract() * 0.3
-}
-
-/// 单根高度：静音或落在活跃区外画小点，否则最大高 × 包络 × 抖动，点条不抖
-fn bar_height(i: i32, level: u8, total: i32, frame: u32) -> i32 {
-    if level == 0 || total <= 0 {
+/// 电平采样成单根高度：静音记点，有声线性映射到可用高
+fn sample_height(level: u8) -> i32 {
+    if level == 0 {
         return DOT_H;
     }
-    let center = total / 2;
-    let active = active_count(level, total);
-    // 对称波形按奇数根取，active 以内算活跃，外面衰减成点
-    if (i - center).abs() * 2 + 1 > active {
-        return DOT_H;
+    ((MAX_H as u16 * level as u16 / 255) as i32).clamp(BAR_W, MAX_H)
+}
+
+/// 新样本入队尾，超出容量挤掉最旧一根，波形整体向左推进
+fn push_sample(history: &mut Vec<i32>, sample: i32, cap: usize) {
+    history.push(sample);
+    if history.len() > cap {
+        history.remove(0);
     }
-    let spread = (active / 3).max(SPREAD_MIN) as f64;
-    let h = MAX_H as f64 * envelope(i, center, spread) * edge_damp(i, total) * jitter(i, frame);
-    (h.round() as i32).clamp(DOT_H, MAX_H)
 }
 
 fn shared() -> (u8, bool) {
@@ -262,7 +234,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
-/// 30ms 节拍：录音中始终显示（有声画波形、无声画点阵），松开立即隐藏
+/// 30ms 节拍：录音中采样电平入历史向左推一格，松开立即隐藏并清空历史
 fn tick(hwnd: HWND) {
     unsafe {
         let (level, recording) = shared();
@@ -271,18 +243,20 @@ fn tick(hwnd: HWND) {
                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 SHOWN.with(|c| c.set(true));
             }
-            let frame = FRAME.with(|c| {
-                c.set(c.get().wrapping_add(1));
-                c.get()
+            let sample = sample_height(level);
+            HISTORY.with(|c| {
+                let mut h = c.borrow_mut();
+                push_sample(&mut h, sample, bar_count(WIDTH) as usize);
             });
             let dc = GetDC(hwnd);
             if !dc.is_null() {
-                draw(dc, hwnd, level, frame);
+                draw(dc, hwnd);
                 ReleaseDC(hwnd, dc);
             }
         } else if SHOWN.with(|c| c.get()) {
             ShowWindow(hwnd, SW_HIDE);
             SHOWN.with(|c| c.set(false));
+            HISTORY.with(|c| c.borrow_mut().clear());
         }
     }
 }
@@ -291,14 +265,13 @@ fn paint(hwnd: HWND) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let dc = BeginPaint(hwnd, &mut ps);
-        let (level, _) = shared();
-        draw(dc, hwnd, level, FRAME.with(|c| c.get()));
+        draw(dc, hwnd);
         EndPaint(hwnd, &ps);
     }
 }
 
 /// 整窗填深灰后逐根画竖条；先画进离屏 DC 再整块贴回，避免逐条绘制时被看见中间态
-fn draw(dc: HDC, hwnd: HWND, level: u8, frame: u32) {
+fn draw(dc: HDC, hwnd: HWND) {
     unsafe {
         let (bg, fg) = brushes();
         let mut rc = RECT::default();
@@ -311,11 +284,11 @@ fn draw(dc: HDC, hwnd: HWND, level: u8, frame: u32) {
             if !mem.is_null() {
                 DeleteDC(mem);
             }
-            render(dc, &rc, level, frame, bg, fg);
+            render(dc, &rc, bg, fg);
             return;
         }
         let old = SelectObject(mem, bmp);
-        render(mem, &rc, level, frame, bg, fg);
+        render(mem, &rc, bg, fg);
         BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
         // 位图还选在 mem 里时删不掉，先还原再回收
         SelectObject(mem, old);
@@ -324,13 +297,30 @@ fn draw(dc: HDC, hwnd: HWND, level: u8, frame: u32) {
     }
 }
 
-fn render(dc: HDC, rc: &RECT, level: u8, frame: u32, bg: HBRUSH, fg: HBRUSH) {
+/// 录音机视图：全宽圆点基线，历史波形右对齐向左铺开，最右全高写入光标
+fn render(dc: HDC, rc: &RECT, bg: HBRUSH, fg: HBRUSH) {
     unsafe {
         FillRect(dc, rc, bg);
-        let total = bar_count(rc.right - rc.left);
         let mid = (rc.bottom - rc.top) / 2;
+        // 基线点与条位同余，波形区的静音点正好续上虚线
+        let mut x = rc.left + DOT_H;
+        while x + DOT_H <= rc.right - DOT_H {
+            let dot = RECT {
+                left: x,
+                top: rc.top + mid - DOT_H / 2,
+                right: x + DOT_H,
+                bottom: rc.top + mid + (DOT_H + 1) / 2,
+            };
+            FillRect(dc, &dot, fg);
+            x += DOT_H * 2;
+        }
+        let total = bar_count(rc.right - rc.left);
+        let history = HISTORY.with(|c| c.borrow().clone());
+        let n = history.len() as i32;
         for i in 0..total {
-            let h = bar_height(i, level, total, frame);
+            // 历史右对齐：尾部最新贴光标，不足整窗时左侧留基线
+            let idx = i - (total - n);
+            let h = if idx >= 0 { history[idx as usize] } else { DOT_H };
             let x = rc.left + PAD + i * (BAR_W + GAP);
             let bar = RECT {
                 left: x,
@@ -340,6 +330,13 @@ fn render(dc: HDC, rc: &RECT, level: u8, frame: u32, bg: HBRUSH, fg: HBRUSH) {
             };
             FillRect(dc, &bar, fg);
         }
+        let cursor = RECT {
+            left: rc.right - PAD - CURSOR_W,
+            top: rc.top,
+            right: rc.right - PAD,
+            bottom: rc.bottom,
+        };
+        FillRect(dc, &cursor, fg);
     }
 }
 
@@ -349,107 +346,49 @@ mod tests {
 
     #[test]
     fn bar_count_from_width() {
-        assert_eq!(bar_count(WIDTH), 42);
-        assert_eq!(bar_count(WIDTH + BAR_W + GAP - 1), 43);
-        assert_eq!(bar_count(WIDTH + BAR_W + GAP), 43);
-        assert_eq!(bar_count(2 * PAD), 0);
+        assert_eq!(bar_count(WIDTH), 47);
+        assert_eq!(bar_count(WIDTH - 1), 46);
+        assert_eq!(bar_count(2 * PAD + CURSOR_W + GAP), 0);
         assert_eq!(bar_count(0), 0);
     }
 
     #[test]
-    fn active_count_floor_and_ceil() {
-        // 电平 0 仍给中心下限，但绘制端在 bar_height 里判成静音全画点
-        assert_eq!(active_count(0, 42), CENTER_MIN);
-        assert_eq!(active_count(1, 42), CENTER_MIN);
-        assert_eq!(active_count(128, 42), 22);
-        assert_eq!(active_count(255, 42), 42);
+    fn sample_height_maps_level_linearly() {
+        assert_eq!(sample_height(0), DOT_H);
+        assert_eq!(sample_height(255), MAX_H);
+        assert_eq!(sample_height(128), MAX_H * 128 / 255);
+        assert!(sample_height(64) < sample_height(128));
+        assert!(sample_height(128) < sample_height(192));
     }
 
     #[test]
-    fn active_count_never_exceeds_total() {
-        assert_eq!(active_count(255, 3), 3);
-        assert_eq!(active_count(255, 0), 0);
-    }
-
-    #[test]
-    fn envelope_peaks_at_center_and_falls() {
-        let c = 39;
-        assert!((envelope(c, c, 6.0) - 1.0).abs() < 1e-12);
-        let near = envelope(c + 1, c, 6.0);
-        let mid = envelope(c + 4, c, 6.0);
-        let far = envelope(c + 9, c, 6.0);
-        assert!(near < 1.0 && mid < near && far < mid);
-    }
-
-    #[test]
-    fn envelope_spreads_symmetrically() {
-        let c = 39;
-        assert!((envelope(c - 5, c, 8.0) - envelope(c + 5, c, 8.0)).abs() < 1e-12);
-    }
-
-    #[test]
-    fn jitter_stays_in_band() {
-        for i in 0..42 {
-            for frame in 0..200 {
-                let j = jitter(i, frame);
-                assert!((0.85..1.15).contains(&j), "i={i} frame={frame} j={j}");
-            }
+    fn push_sample_scrolls_out_oldest() {
+        let mut h = Vec::new();
+        for i in 0..60 {
+            push_sample(&mut h, i, 47);
         }
+        assert_eq!(h.len(), 47);
+        assert_eq!(h[0], 13);
+        assert_eq!(h[46], 59);
     }
 
     #[test]
-    fn jitter_changes_across_frames() {
-        let mut distinct = 0;
-        for f in 1..30 {
-            if jitter(20, f) != jitter(20, f - 1) {
-                distinct += 1;
-            }
-        }
-        assert!(distinct > 20, "逐帧波动太弱: {distinct}");
+    fn push_sample_keeps_short_history() {
+        let mut h = Vec::new();
+        push_sample(&mut h, DOT_H, 47);
+        push_sample(&mut h, MAX_H, 47);
+        assert_eq!(h, vec![DOT_H, MAX_H]);
     }
 
     #[test]
-    fn silent_level_draws_dots_everywhere() {
-        for i in 0..42 {
-            assert_eq!(bar_height(i, 0, 42, 5), DOT_H);
-        }
+    fn dot_pitch_matches_bar_pitch() {
+        // 基线点距与波形区节拍一致，静音点才能和基线虚线连成一条
+        assert_eq!(BAR_W + GAP, DOT_H * 2);
     }
 
     #[test]
-    fn full_level_bars_stay_in_range_and_center_taller() {
-        for i in 0..42 {
-            let h = bar_height(i, 255, 42, 7);
-            assert!((DOT_H..=MAX_H).contains(&h), "i={i} h={h}");
-        }
-        // 中心最高，最外侧衰减到点高
-        assert!(bar_height(21, 255, 42, 7) > DOT_H);
-        assert!(bar_height(21, 255, 42, 7) > bar_height(0, 255, 42, 7));
-    }
-
-    #[test]
-    fn side_bars_decay_to_dots() {
-        // 电平 20 -> 活跃 5 根（CENTER_MIN 兜底），中心两侧第 3 根起衰减成点
-        assert!(bar_height(21, 20, 42, 3) > DOT_H);
-        assert!(bar_height(21 + 2, 20, 42, 3) > DOT_H);
-        assert_eq!(bar_height(21 + 3, 20, 42, 3), DOT_H);
-        assert_eq!(bar_height(21 - 3, 20, 42, 3), DOT_H);
-    }
-
-    #[test]
-    fn heights_never_overflow_window() {
-        for level in [1u8, 64, 128, 200, 255] {
-            for i in 0..42 {
-                assert!(bar_height(i, level, 42, 31) <= MAX_H);
-            }
-        }
-    }
-
-    #[test]
-    fn edge_damp_pins_outer_bar_to_one_sixth() {
-        let min = EDGE_MIN;
-        assert!((edge_damp(0, 42) - min).abs() < 1e-12);
-        assert!((edge_damp(41, 42) - min).abs() < 1e-12);
-        assert!((edge_damp(6, 42) - 1.0).abs() < 1e-12);
-        assert!(edge_damp(3, 42) > min && edge_damp(3, 42) < 1.0);
+    fn history_fits_between_pads_and_cursor() {
+        // 条区 + 间隙 + 光标 + 右边距恰好填满窗口
+        assert_eq!(PAD + bar_count(WIDTH) * (BAR_W + GAP) + GAP + CURSOR_W + PAD, WIDTH);
     }
 }
