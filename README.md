@@ -16,14 +16,15 @@
 
 A voice input method based on the MAI STT service
 
-Hold space, speak, release — the transcript is pasted into whatever app has focus The client protocol is reimplemented from the MIT-licensed VS Code sources, no VS Code installation required
+Hold space and speak — confirmed text streams into the focused app as you talk, release finalizes the tail The client protocol is reimplemented from the MIT-licensed VS Code sources, no VS Code installation required
 
 ## How it works
 
 - Hold right Ctrl: captures 16 kHz mono audio from the default microphone
 - Streams audio over WebSocket to the MAI transcription endpoint
 - Authenticates with a GitHub OAuth token, same as VS Code voice mode
-- Release space: the final transcript is placed on the clipboard and pasted with Ctrl+V
+- While speaking: each confirmed fragment is streamed to the cursor via Ctrl+V as the service finalizes it
+- Release space: the remaining final transcript is pasted the same way
 - A small black level bar near the top of the screen animates with your voice while recording
 
 ## Requirements

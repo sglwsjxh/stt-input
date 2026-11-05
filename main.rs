@@ -257,6 +257,9 @@ async fn do_turn(
         o.set_visible(true);
     }
     let started = Instant::now();
+    // 已上屏内容（committed 水位线）；已粘出去的收不回，只在前缀一致时续粘
+    let mut pasted = String::new();
+    let mut stream_on = true;
     loop {
         match tokio::time::timeout(POLL, rx.recv()).await {
             Ok(Some(block)) => {
@@ -264,6 +267,21 @@ async fn do_turn(
                     o.set_level(peak_level(&block));
                 }
                 c.push_audio(&turn, &block).await;
+                // 流式上屏：边说边把新定稿片段粘到光标处
+                let committed = c.try_committed(&turn);
+                if stream_on && !committed.is_empty() {
+                    if committed.starts_with(&pasted) {
+                        if committed.len() > pasted.len() {
+                            match paster.paste(&committed[pasted.len()..]) {
+                                Ok(()) => pasted = committed,
+                                Err(e) => tracing::warn!("流式粘贴失败: {e}"),
+                            }
+                        }
+                    } else {
+                        tracing::warn!("committed 改写了已上屏前缀，停止流式输出");
+                        stream_on = false;
+                    }
+                }
             }
             Ok(None) => {
                 if let Some(o) = overlay {
@@ -286,11 +304,19 @@ async fn do_turn(
     }
     c.end_turn(&turn).await;
     let text = c.await_final(&turn, FINAL_WAIT).await.wrap_err("识别失败")?;
-    if text.trim().is_empty() {
+    // final 为权威全文，与已上屏前缀一致才补粘残余尾巴，改写或缩短都收不回已粘部分
+    if text.starts_with(&pasted) {
+        let tail = &text[pasted.len()..];
+        if !tail.trim().is_empty() {
+            paster.paste(tail)?;
+        }
+    } else {
+        tracing::warn!("final 与已上屏前缀不一致，跳过尾巴补粘");
+    }
+    if pasted.is_empty() && text.trim().is_empty() {
         tracing::info!("未识别到内容");
         return Ok(());
     }
-    paster.paste(&text)?;
     tracing::info!(%text, "已粘贴");
     Ok(())
 }

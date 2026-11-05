@@ -20,7 +20,7 @@
 // 代理与 TLS 同 auth.rs 规则（CONNECT 隧道），其函数为私有，此处做最小本地复制
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
@@ -72,6 +72,8 @@ enum Evt {
         turn_id: String,
         status: String,
         text: String,
+        // 已定稿前缀，partial 帧中途即有值；final 帧恒等于 text
+        committed: String,
     },
     Error {
         code: i64,
@@ -151,6 +153,8 @@ pub struct TranscriptionClient {
     evt_rx: Receiver<Evt>,
     // 连接存活标志：worker 任何退出路径置 false，供空闲期判断是否需要重连
     connected: Arc<AtomicBool>,
+    // 流式轮询挑走转写帧后，非转写帧暂存于此，保证 await_final 不漏 error/dead
+    pending: VecDeque<Evt>,
 }
 
 impl TranscriptionClient {
@@ -189,29 +193,28 @@ impl TranscriptionClient {
     pub async fn await_final(&mut self, turn_id: &str, timeout: Duration) -> Result<String> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut last: Option<String> = None;
+        // 流式轮询暂存的帧先消化，final 与终端错误不被漏掉
+        for evt in std::mem::take(&mut self.pending) {
+            if let Some(r) = absorb(evt, turn_id, &mut last) {
+                return r;
+            }
+        }
         loop {
             match self.evt_rx.try_recv() {
-                Ok(Evt::Transcription {
-                    turn_id: t,
-                    status,
-                    text,
-                }) => {
-                    if t == turn_id {
-                        if status == "final" {
-                            return Ok(text);
-                        }
-                        last = Some(text);
+                Ok(evt) => {
+                    if let Some(r) = absorb(evt, turn_id, &mut last) {
+                        return r;
                     }
                 }
-                Ok(Evt::Error {
-                    code,
-                    detail,
-                    terminal: true,
-                }) => return Err(eyre!("服务端错误 code={code} {detail}")),
-                Ok(Evt::Dead(reason)) => return Err(eyre!(reason)),
-                Ok(_) => {}
+                Err(TryRecvError::Disconnected) => {
+                    for evt in std::mem::take(&mut self.pending) {
+                        if let Some(r) = absorb(evt, turn_id, &mut last) {
+                            return r;
+                        }
+                    }
+                    return Err(eyre!("工作线程已退出"));
+                }
                 Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => return Err(eyre!("工作线程已退出")),
             }
             if tokio::time::Instant::now() >= deadline {
                 return last.map(Ok).unwrap_or_else(|| {
@@ -219,6 +222,42 @@ impl TranscriptionClient {
                 });
             }
             tokio::time::sleep(POLL).await;
+        }
+    }
+
+    // 非阻塞捞本 turn 已定稿前缀，多条积压取最新；软错误与非本 turn 帧同 await_final 规则消化
+    pub fn try_committed(&mut self, turn_id: &str) -> String {
+        let mut committed = String::new();
+        loop {
+            let evt = match self.pending.pop_front() {
+                Some(e) => e,
+                None => match self.evt_rx.try_recv() {
+                    Ok(e) => e,
+                    Err(_) => return committed,
+                },
+            };
+            // final、终端错误、死亡帧停手放回队头保持原序，其余帧消化跳过
+            let sticky = match &evt {
+                Evt::Transcription { turn_id: t, status, .. } => {
+                    t == turn_id && status == "final"
+                }
+                Evt::Error { terminal: true, .. } => true,
+                Evt::Dead(_) => true,
+                _ => false,
+            };
+            if sticky {
+                self.pending.push_front(evt);
+                return committed;
+            }
+            if let Evt::Transcription {
+                turn_id: t,
+                committed: c,
+                ..
+            } = evt
+                && t == turn_id
+            {
+                committed = c;
+            }
         }
     }
 
@@ -272,6 +311,32 @@ impl TranscriptionClient {
     }
 }
 
+// 单帧归约：final 返回全文，终端错误或连接死亡返回 Err，其余只推进 last
+fn absorb(evt: Evt, turn_id: &str, last: &mut Option<String>) -> Option<Result<String>> {
+    match evt {
+        Evt::Transcription {
+            turn_id: t,
+            status,
+            text,
+            committed: _,
+        } if t == turn_id => {
+            if status == "final" {
+                Some(Ok(text))
+            } else {
+                *last = Some(text);
+                None
+            }
+        }
+        Evt::Error {
+            code,
+            detail,
+            terminal: true,
+        } => Some(Err(eyre!("服务端错误 code={code} {detail}"))),
+        Evt::Dead(reason) => Some(Err(eyre!(reason))),
+        _ => None,
+    }
+}
+
 fn establish(url: &str, bypass_proxy: bool) -> Result<TranscriptionClient> {
     let (secure, host, port) = split_ws_url(url)?;
     let stream = if secure {
@@ -303,6 +368,7 @@ fn establish(url: &str, bypass_proxy: bool) -> Result<TranscriptionClient> {
         cmd_tx,
         evt_rx,
         connected,
+        pending: VecDeque::new(),
     })
 }
 
@@ -408,6 +474,7 @@ fn worker_loop(
                             turn_id: msg.turn_id.clone(),
                             status: msg.status.clone(),
                             text: msg.text.clone(),
+                            committed: msg.committed.clone(),
                         };
                         if evt_tx.send(evt).is_err() {
                             return;
@@ -652,11 +719,17 @@ mod tests {
         let _ = ws.send(Message::text(v.to_string()));
     }
 
-    // 帧形与实测样本一致：committed 恒存在，partial 为空串
-    fn transcription(turn: &str, text: &str, status: &str, revision: u64) -> Value {
+    // 帧形与实测样本一致：committed 恒存在，partial 中途即携带已定稿前缀
+    fn transcription(
+        turn: &str,
+        text: &str,
+        status: &str,
+        revision: u64,
+        committed: &str,
+    ) -> Value {
         json!({
             "type":"transcription","text":text,"status":status,
-            "committed": if status == "final" { text } else { "" },
+            "committed":committed,
             "turn_id":turn,"revision":revision
         })
     }
@@ -705,14 +778,12 @@ mod tests {
                     _ => {}
                 }
             }
-            send_json(ws, transcription(&turn, "测试听写一二。", "partial", 1));
-            send_json(ws, transcription(&turn, "语音识别测。", "partial", 2));
+            send_json(ws, transcription(&turn, "测试听写一二。", "partial", 1, "测试听写。"));
+            send_json(ws, transcription(&turn, "语音识别测。", "partial", 2, "语音识别。"));
             // 乱序补发旧 revision，客户端应丢弃
-            send_json(ws, transcription(&turn, "STALE", "partial", 1));
-            send_json(
-                ws,
-                transcription(&turn, &format!("FINAL chunks={chunks} b64={b64_len}"), "final", 3),
-            );
+            send_json(ws, transcription(&turn, "STALE", "partial", 1, ""));
+            let final_text = format!("FINAL chunks={chunks} b64={b64_len}");
+            send_json(ws, transcription(&turn, &final_text, "final", 3, &final_text));
             thread::sleep(Duration::from_secs(2));
         });
         let mut c = TranscriptionClient::open(client_url(addr), true).await?;
@@ -732,9 +803,9 @@ mod tests {
             send_json(ws, json!({"type":"session_init","session_id":"t"}));
             let start = next_cmd_text(ws, "ptt_start");
             let turn = start["turn_id"].as_str().unwrap_or("").to_string();
-            send_json(ws, transcription(&turn, "P2", "partial", 2));
+            send_json(ws, transcription(&turn, "P2", "partial", 2, "P2"));
             // 若 <= 已见 revision 未被丢弃，await_final 会拿到 P1-STALE
-            send_json(ws, transcription(&turn, "P1-STALE", "partial", 1));
+            send_json(ws, transcription(&turn, "P1-STALE", "partial", 1, ""));
             thread::sleep(Duration::from_secs(3));
         });
         let mut c = TranscriptionClient::open(client_url(addr), true).await?;
@@ -757,6 +828,67 @@ mod tests {
             .await
             .expect_err("应有错误");
         assert!(err.to_string().contains("超时"), "错误内容: {err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn try_committed_streams_prefix_and_spares_final() -> Result<()> {
+        let addr = fake_server(|ws| {
+            send_json(ws, json!({"type":"session_init","session_id":"t"}));
+            let start = next_cmd_text(ws, "ptt_start");
+            let turn = start["turn_id"].as_str().unwrap_or("").to_string();
+            send_json(ws, transcription(&turn, "你好", "partial", 1, "你好"));
+            send_json(ws, transcription(&turn, "你好世界", "partial", 2, "你好世界"));
+            // 软错误帧应被暂存绕过，不影响流式轮询与 final
+            send_json(ws, json!({"type":"error","code":0,"detail":"soft","turn_id":&turn}));
+            send_json(ws, transcription(&turn, "你好世界。", "final", 3, "你好世界。"));
+            thread::sleep(Duration::from_secs(2));
+        });
+        let mut c = TranscriptionClient::open(client_url(addr), true).await?;
+        let turn = c.start_turn().await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = String::new();
+        while got != "你好世界" && Instant::now() < deadline {
+            let latest = c.try_committed(&turn);
+            if !latest.is_empty() {
+                got = latest;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(got, "你好世界");
+        c.end_turn(&turn).await;
+        // final 被 try_committed 暂存而非吞掉，await_final 仍能拿到
+        let out = c.await_final(&turn, Duration::from_secs(5)).await?;
+        assert_eq!(out, "你好世界。");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_connection_survives_stream_polling() -> Result<()> {
+        let addr = fake_server(|ws| {
+            send_json(ws, json!({"type":"session_init","session_id":"t"}));
+            let start = next_cmd_text(ws, "ptt_start");
+            let turn = start["turn_id"].as_str().unwrap_or("").to_string();
+            send_json(ws, transcription(&turn, "P", "partial", 1, "P"));
+            let _ = ws.close(None);
+            thread::sleep(Duration::from_millis(300));
+        });
+        let mut c = TranscriptionClient::open(client_url(addr), true).await?;
+        let turn = c.start_turn().await;
+        // 捞走 partial；worker 收 Close 发出的 Dead 帧被暂存
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while c.try_committed(&turn).is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        c.end_turn(&turn).await;
+        let started = Instant::now();
+        let err = c
+            .await_final(&turn, Duration::from_secs(5))
+            .await
+            .expect_err("断连后应报错");
+        // 暂存的 Dead 帧让 await_final 立即失败，而不是耗尽 5 秒超时
+        assert!(started.elapsed() < Duration::from_secs(4), "应快速失败");
+        assert!(!err.to_string().contains("超时"), "错误内容: {err}");
         Ok(())
     }
 
